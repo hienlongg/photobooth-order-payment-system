@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str = "photobooth_secure_pass"
     POSTGRES_DB: str = "photobooth_db"
 
+    # Payment Gateway Configuration (PayOS / VietQR)
+    PAYOS_CLIENT_ID: str = "fake-payos-client-id"
+    PAYOS_API_KEY: str = "fake-payos-api-key"
+    PAYOS_CHECKSUM_KEY: str = "fake_payos_checksum_key_for_testing"
+    ORDER_PAYMENT_TIMEOUT_MINUTES: int = 15
+
     @computed_field
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:
