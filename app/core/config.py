@@ -1,6 +1,7 @@
 from pydantic import computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -20,10 +21,11 @@ class Settings(BaseSettings):
     POSTGRES_USER: str = "photobooth"
     POSTGRES_PASSWORD: str = "photobooth_secure_pass"
     POSTGRES_DB: str = "photobooth_db"
-    
+
     @computed_field
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:
         return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
-    
+
+
 settings = Settings()

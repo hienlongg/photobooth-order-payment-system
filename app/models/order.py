@@ -1,9 +1,16 @@
 import uuid
+from typing import TYPE_CHECKING
+
 from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from app.models.machine import Machine
+    from app.models.package import Package
+    from app.models.tenant import Tenant
 
 
 class Order(Base, TimestampMixin):
@@ -24,18 +31,31 @@ class Order(Base, TimestampMixin):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     machine_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("machines.id", ondelete="RESTRICT"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("machines.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     package_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("packages.id", ondelete="RESTRICT"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("packages.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
-    order_code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    order_code: Mapped[str] = mapped_column(
+        String(50), unique=True, nullable=False, index=True
+    )
     amount_vnd: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
-    payment_method: Mapped[str] = mapped_column(String(50), default="qr_pay", nullable=False)
+    payment_method: Mapped[str] = mapped_column(
+        String(50), default="qr_pay", nullable=False
+    )
 
     tenant: Mapped["Tenant"] = relationship("Tenant", back_populates="orders")
     machine: Mapped["Machine"] = relationship("Machine", back_populates="orders")

@@ -1,4 +1,6 @@
+import datetime
 from uuid import UUID
+
 from pydantic import BaseModel, ConfigDict
 
 
@@ -13,9 +15,9 @@ class TokenResponse(BaseModel):
 
 
 class TokenPayload(BaseModel):
-    sub: str          # User ID
-    tenant_id: str    # Tenant ID
-    role: str         # "admin", "operator", "customer"
+    sub: str  # User ID
+    tenant_id: str  # Tenant ID
+    role: str  # "admin", "operator", "customer"
     exp: int
 
 
@@ -28,3 +30,4 @@ class UserResponse(BaseModel):
     full_name: str | None = None
     role: str
     is_active: bool
+    created_at: datetime.datetime

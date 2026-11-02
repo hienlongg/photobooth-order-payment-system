@@ -1,4 +1,5 @@
 import math
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,12 +31,12 @@ async def list_machines(
     count_query = select(func.count(Machine.id)).where(base_filter)
     total_count = (await db.execute(count_query)).scalar() or 0
 
-    # 3. Calculate offset and query page items
+    # 3. Calculate offset and query page items with deterministic sorting
     offset = (page - 1) * page_size
     items_query = (
         select(Machine)
         .where(base_filter)
-        .order_by(Machine.created_at.desc())
+        .order_by(Machine.created_at.desc(), Machine.id.desc())
         .offset(offset)
         .limit(page_size)
     )

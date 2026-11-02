@@ -1,7 +1,7 @@
 import datetime
 from uuid import UUID
-from typing import List
-from pydantic import BaseModel, ConfigDict, Field
+
+from pydantic import BaseModel, ConfigDict
 
 
 class MachineResponse(BaseModel):
@@ -18,7 +18,7 @@ class MachineResponse(BaseModel):
 
 
 class PaginatedMachineResponse(BaseModel):
-    items: List[MachineResponse]
+    items: list[MachineResponse]
     total: int
     page: int
     page_size: int
