@@ -1,3 +1,4 @@
+import datetime
 import math
 import secrets
 import string
@@ -9,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, require_role
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.machine import Machine
 from app.models.order import Order
@@ -19,6 +21,17 @@ from app.schemas.order import (
     OrderResponse,
     OrderStatusUpdate,
     PaginatedOrderResponse,
+)
+from app.schemas.payment import (
+    OrderPaymentStatusResponse,
+    PaymentCreateRequest,
+    PaymentResponse,
+)
+from app.services.payment.service import PaymentService
+from app.services.payment.state_machine import (
+    InvalidOrderStateTransitionError,
+    OrderStateMachine,
+    OrderStatus,
 )
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
@@ -106,16 +119,21 @@ async def create_order(
     # 5. Order insertion with collision retry on unique order_code
     max_retries = 3
     new_order = None
+    now = datetime.datetime.now(datetime.UTC)
+    expires_at = now + datetime.timedelta(minutes=settings.ORDER_PAYMENT_TIMEOUT_MINUTES)
 
     for attempt in range(max_retries):
+        numeric_code = secrets.randbelow(900_000_000) + 100_000_000
         order_candidate = Order(
             tenant_id=current_user.tenant_id,
             machine_id=machine.id,
             package_id=package.id,
             order_code=generate_order_code(),
+            numeric_order_code=numeric_code,
             amount_vnd=package.price_vnd,
-            status="pending",
+            status=OrderStatus.PENDING.value,
             payment_method=payload.payment_method,
+            expires_at=expires_at,
         )
         try:
             async with db.begin_nested():
@@ -135,6 +153,48 @@ async def create_order(
     return OrderResponse.model_validate(new_order)
 
 
+@router.post(
+    "/{id}/payments",
+    response_model=PaymentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_order_payment(
+    id: uuid.UUID,
+    payload: PaymentCreateRequest = PaymentCreateRequest(),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PaymentResponse:
+    """
+    Create a payment request (VietQR code & payment link) for an order.
+    """
+    payment = await PaymentService.create_order_payment(
+        db=db,
+        order_id=id,
+        current_user=current_user,
+        provider_name=payload.provider,
+    )
+    return PaymentResponse.model_validate(payment)
+
+
+@router.get(
+    "/{id}/payment-status",
+    response_model=OrderPaymentStatusResponse,
+)
+async def get_order_payment_status(
+    id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> OrderPaymentStatusResponse:
+    """
+    Query real-time payment status, QR code, and audit event ledger for an order.
+    """
+    return await PaymentService.get_order_payment_status(
+        db=db,
+        order_id=id,
+        current_user=current_user,
+    )
+
+
 @router.get("", response_model=PaginatedOrderResponse)
 async def list_orders(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
@@ -142,7 +202,7 @@ async def list_orders(
     status_filter: str | None = Query(
         None,
         alias="status",
-        description="Filter by status ('pending', 'completed', 'cancelled')",
+        description="Filter by status (e.g. 'PENDING', 'PAID', 'COMPLETED', 'CANCELLED')",
     ),
     machine_id: uuid.UUID | None = Query(None, description="Filter by machine ID"),
     db: AsyncSession = Depends(get_db),
@@ -157,7 +217,7 @@ async def list_orders(
     base_filters = [Order.tenant_id == current_user.tenant_id]
 
     if status_filter:
-        base_filters.append(Order.status == status_filter)
+        base_filters.append(Order.status.ilike(status_filter))
     if machine_id:
         base_filters.append(Order.machine_id == machine_id)
 
@@ -222,13 +282,10 @@ async def update_order_status(
     current_user: User = Depends(require_role(["admin", "operator"])),
 ) -> OrderResponse:
     """
-    Update an order's status (e.g. mark 'completed' after payment/printing, or 'cancelled').
+    Update an order's status (e.g. mark 'COMPLETED' after photo printing, or 'CANCELLED').
     - Restricted to 'admin' and 'operator' roles.
-    - Validates state transition: once 'completed' or 'cancelled', an order cannot be re-opened.
+    - Validates state transition via OrderStateMachine.
     """
-    # Row-level lock (SELECT ... FOR UPDATE): concurrent updates to the same order
-    # wait here until this transaction commits, then re-read the final status.
-    # Without it, two requests can both see 'pending' and both succeed.
     result = await db.execute(
         select(Order)
         .where(
@@ -244,14 +301,15 @@ async def update_order_status(
             detail=f"Order {id} not found",
         )
 
-    # State transition validation
-    if order.status in ("completed", "cancelled"):
+    target_status = OrderStateMachine.normalize_status(payload.status)
+    try:
+        OrderStateMachine.transition(order, target_status)
+    except InvalidOrderStateTransitionError as err:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot transition order from final state '{order.status}' to '{payload.status}'",
+            detail=str(err),
         )
 
-    order.status = payload.status
     await db.commit()
     await db.refresh(order)
 
