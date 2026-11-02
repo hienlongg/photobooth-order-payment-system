@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: photobooth-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: photobooth
+      POSTGRES_PASSWORD: photobooth_secure_pass
+      POSTGRES_DB: photobooth_db
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U photobooth -d photobooth_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
