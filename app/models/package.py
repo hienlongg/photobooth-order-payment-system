@@ -1,6 +1,6 @@
 import uuid
 from typing import List
-from sqlalchemy import Boolean, ForeignKey, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -9,6 +9,11 @@ from app.db.base import Base, TimestampMixin
 
 class Package(Base, TimestampMixin):
     __tablename__ = "packages"
+    __table_args__ = (
+        CheckConstraint("price_vnd > 0", name="check_positive_package_price"),
+        CheckConstraint("duration_seconds > 0", name="check_positive_package_duration"),
+        Index("ix_packages_tenant_is_active", "tenant_id", "is_active"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
