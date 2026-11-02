@@ -1,9 +1,10 @@
+import math
 import secrets
 import string
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +14,12 @@ from app.models.machine import Machine
 from app.models.order import Order
 from app.models.package import Package
 from app.models.user import User
-from app.schemas.order import OrderCreateRequest, OrderResponse
+from app.schemas.order import (
+    OrderCreateRequest,
+    OrderResponse,
+    OrderStatusUpdate,
+    PaginatedOrderResponse,
+)
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -38,7 +44,7 @@ async def create_order(
     - Validates machine is active and online.
     - Validates package is active.
     - Anti-tampering: enforces server-authoritative pricing from package.price_vnd.
-    - Resilient: handles order_code collision with automatic retries.
+    - Resilient: handles order_code collision with automatic savepoint retries.
     """
     # 1. Tenant status check
     if not current_user.tenant.is_active:
@@ -128,6 +134,59 @@ async def create_order(
     return OrderResponse.model_validate(new_order)
 
 
+@router.get("", response_model=PaginatedOrderResponse)
+async def list_orders(
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(10, ge=1, le=100, description="Items per page (max 100)"),
+    status_filter: str | None = Query(
+        None,
+        alias="status",
+        description="Filter by status ('pending', 'completed', 'cancelled')",
+    ),
+    machine_id: uuid.UUID | None = Query(None, description="Filter by machine ID"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> PaginatedOrderResponse:
+    """
+    Retrieve a paginated list of orders for the caller's tenant.
+    - Scoped strictly to caller's tenant.
+    - Supports optional filtering by order status and machine_id.
+    - Deterministic ordering by created_at.desc(), id.desc().
+    """
+    base_filters = [Order.tenant_id == current_user.tenant_id]
+
+    if status_filter:
+        base_filters.append(Order.status == status_filter)
+    if machine_id:
+        base_filters.append(Order.machine_id == machine_id)
+
+    # 1. Total count query
+    count_query = select(func.count(Order.id)).where(*base_filters)
+    total_count = (await db.execute(count_query)).scalar() or 0
+
+    # 2. Paginated items query
+    offset = (page - 1) * page_size
+    items_query = (
+        select(Order)
+        .where(*base_filters)
+        .order_by(Order.created_at.desc(), Order.id.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    items_result = await db.execute(items_query)
+    orders = items_result.scalars().all()
+
+    total_pages = math.ceil(total_count / page_size) if total_count > 0 else 0
+
+    return PaginatedOrderResponse(
+        items=[OrderResponse.model_validate(o) for o in orders],
+        total=total_count,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
+
+
 @router.get("/{id}", response_model=OrderResponse)
 async def get_order_by_id(
     id: uuid.UUID,
@@ -150,5 +209,44 @@ async def get_order_by_id(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Order {id} not found",
         )
+
+    return OrderResponse.model_validate(order)
+
+
+@router.patch("/{id}", response_model=OrderResponse)
+async def update_order_status(
+    id: uuid.UUID,
+    payload: OrderStatusUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role(["admin", "operator"])),
+) -> OrderResponse:
+    """
+    Update an order's status (e.g. mark 'completed' after payment/printing, or 'cancelled').
+    - Restricted to 'admin' and 'operator' roles.
+    - Validates state transition: once 'completed' or 'cancelled', an order cannot be re-opened.
+    """
+    result = await db.execute(
+        select(Order).where(
+            Order.id == id,
+            Order.tenant_id == current_user.tenant_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Order {id} not found",
+        )
+
+    # State transition validation
+    if order.status in ("completed", "cancelled"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot transition order from final state '{order.status}' to '{payload.status}'",
+        )
+
+    order.status = payload.status
+    await db.flush()
+    await db.refresh(order)
 
     return OrderResponse.model_validate(order)
