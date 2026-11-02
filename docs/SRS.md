@@ -67,6 +67,8 @@ Operating an unattended, distributed fleet of commercial photobooths presents fo
 - Centralizes remote machine fleet monitoring, package catalog management, and revenue analytics.
 - Distributes digital media assets contactlessly via ephemeral pre-signed Cloud Object Storage (S3 / R2) URLs and mobile-scannable QR codes without capturing personal identifying information (PII).
 
+*(Note: The system context boundary and external interfaces are modeled in the C4 Context diagram; the editable vector file is maintained at [`docs/diagrams/c4-context-model.excalidraw`](diagrams/c4-context-model.excalidraw).)*
+
 ---
 
 # 4. Stakeholders

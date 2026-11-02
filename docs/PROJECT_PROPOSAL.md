@@ -136,6 +136,8 @@ The platform scope is prioritized using the **MoSCoW** framework. Only **Must-ha
 
 The following C4 System Context diagram illustrates the boundaries of the Photobooth SaaS Platform, its user personas, and its interactions with external supporting systems:
 
+> **Editable Architecture Diagram:** An editable Excalidraw vector scene corresponding to this context model is maintained at [`docs/diagrams/c4-context-model.excalidraw`](diagrams/c4-context-model.excalidraw).
+
 ```mermaid
 C4Context
     title System Context Diagram for SnapSync Photobooth Platform

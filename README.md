@@ -26,6 +26,7 @@ Comprehensive engineering specifications are located in the [`docs/`](docs/) dir
 | **Requirements Specification (SRS)** | Problem statement, functional requirements (FR-01 to FR-18), measurable NFRs, business rules, and acceptance criteria. | [`docs/SRS.md`](docs/SRS.md) |
 | **Project Proposal & Plan** | Commercial vision, product positioning, risk management matrix, and work breakdown structure (WBS). | [`docs/PROJECT_PROPOSAL.md`](docs/PROJECT_PROPOSAL.md) |
 | **Architecture Decision Records (ADRs)** | Formal records documenting key architectural choices (FastAPI async, dual ledger, multi-tenancy, pre-signed S3). | [`docs/design/adr/`](docs/design/adr/) |
+| **C4 Context Model (Excalidraw)** | Editable vector scene for C4 System Context Model [`docs/diagrams/c4-context-model.excalidraw`](docs/diagrams/c4-context-model.excalidraw) |
 
 ---
 
@@ -55,7 +56,10 @@ photobooth-backend/
 │   ├── DESIGN.md               # Software Design Document (C4, OOD, Data)
 │   ├── SRS.md                  # Software Requirements Specification
 │   ├── PROJECT_PROPOSAL.md     # Proposal & Milestone Plan
+│   ├── diagrams/               # Architecture vector diagrams
+│   │   └── c4-context-model.excalidraw # Editable C4 Context Excalidraw scene
 │   ├── design/adr/             # Architecture Decision Records
+│   └── guide/                  # Day 1 & Day 2 implementation guides
 └── app/
     ├── main.py                 # FastAPI application factory & lifespan
     ├── core/

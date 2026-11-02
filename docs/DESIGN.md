@@ -146,6 +146,8 @@ SnapSync employs a **Hybrid Architectural Style** combining:
 
 The System Context diagram illustrates the boundary of the **SnapSync Photobooth SaaS Platform**, the human actors who interact with it, and the external software and banking systems with which it interfaces.
 
+> **Visual Modeling Asset:** An interactive, vector-editable Excalidraw version of this C4 Context Model is preserved in the repository at [`docs/diagrams/c4-context-model.excalidraw`](diagrams/c4-context-model.excalidraw).
+
 ```mermaid
 C4Context
     title System Context Diagram (C4 Level 1) — SnapSync Photobooth SaaS Platform
