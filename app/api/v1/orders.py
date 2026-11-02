@@ -130,6 +130,7 @@ async def create_order(
                     detail="Failed to generate a unique order code. Please retry.",
                 )
 
+    await db.commit()
     await db.refresh(new_order)
     return OrderResponse.model_validate(new_order)
 
@@ -246,7 +247,7 @@ async def update_order_status(
         )
 
     order.status = payload.status
-    await db.flush()
+    await db.commit()
     await db.refresh(order)
 
     return OrderResponse.model_validate(order)

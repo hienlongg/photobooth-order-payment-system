@@ -1,5 +1,4 @@
 from collections.abc import AsyncGenerator
-
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -30,12 +29,14 @@ AsyncSessionLocal = async_sessionmaker(
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     FastAPI dependency that yields an async database session per request.
-    Handles commit on success, rollback on exception, and connection closing in finally.
+    - Write operations (POST/PATCH/DELETE) commit explicitly within route handlers
+      before responses are sent to ensure data is committed to disk before returning 201/200.
+    - Handles automatic rollback on any unhandled exception.
+    - Closes and returns the connection to the pool in the finally block.
     """
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise
