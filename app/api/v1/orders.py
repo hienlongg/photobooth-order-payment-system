@@ -226,11 +226,16 @@ async def update_order_status(
     - Restricted to 'admin' and 'operator' roles.
     - Validates state transition: once 'completed' or 'cancelled', an order cannot be re-opened.
     """
+    # Row-level lock (SELECT ... FOR UPDATE): concurrent updates to the same order
+    # wait here until this transaction commits, then re-read the final status.
+    # Without it, two requests can both see 'pending' and both succeed.
     result = await db.execute(
-        select(Order).where(
+        select(Order)
+        .where(
             Order.id == id,
             Order.tenant_id == current_user.tenant_id,
         )
+        .with_for_update()
     )
     order = result.scalar_one_or_none()
     if not order:
