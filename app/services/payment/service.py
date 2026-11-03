@@ -1,9 +1,10 @@
 import datetime
+import secrets
 from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -44,6 +45,26 @@ class PaymentService:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unsupported payment provider: '{provider_name}'",
+        )
+
+    @staticmethod
+    async def _ensure_numeric_order_code(db: AsyncSession, order: Order) -> int:
+        """Assigns and PERSISTS a unique numeric code for legacy orders lacking one,
+        so webhooks quoting that code can be matched."""
+        if order.numeric_order_code is not None:
+            return order.numeric_order_code
+        for _ in range(5):
+            candidate = secrets.randbelow(900_000_000) + 100_000_000
+            try:
+                async with db.begin_nested():
+                    order.numeric_order_code = candidate
+                    await db.flush()
+                return candidate
+            except IntegrityError:
+                order.numeric_order_code = None
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to allocate a unique numeric order code. Please retry.",
         )
 
     @classmethod
@@ -90,7 +111,7 @@ class PaymentService:
             )
 
         provider = cls.get_provider(provider_name)
-        numeric_code = order.numeric_order_code or int(order.id.int % 100_000_000)
+        numeric_code = await cls._ensure_numeric_order_code(db, order)
 
         # 4. Request provider payment generation
         req_data = PaymentRequestData(
@@ -122,6 +143,25 @@ class PaymentService:
         await db.refresh(payment)
         return payment
 
+    @staticmethod
+    def _parse_amount(raw: Any) -> int:
+        """Strict VND amount parsing: whole, non-negative integers only."""
+        value: int | None = None
+        if isinstance(raw, bool) or raw is None:
+            value = None
+        elif isinstance(raw, int):
+            value = raw
+        elif isinstance(raw, float) and raw.is_integer():
+            value = int(raw)
+        elif isinstance(raw, str) and raw.strip().isdigit():
+            value = int(raw.strip())
+        if value is None or value < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or missing 'amount' in webhook data",
+            )
+        return value
+
     @classmethod
     async def process_webhook(
         cls,
@@ -150,7 +190,7 @@ class PaymentService:
 
         # Extract transaction identifiers
         order_code_raw = data.get("orderCode")
-        amount_received = int(data.get("amount", 0))
+        amount_received = cls._parse_amount(data.get("amount"))
         reference = str(data.get("reference") or data.get("paymentLinkId") or "")
         description = str(data.get("description", ""))
         # PayOS success code is "00"; anything else means the payment did not succeed.
@@ -196,10 +236,19 @@ class PaymentService:
 
         # Check description substring match
         if not order and description:
+            # The description (e.g. "PAY ABC123") must CONTAIN the order code. Use
+            # strpos rather than LIKE so '%'/'_' are never treated as wildcards.
             res = await db.execute(
-                select(Order).where(Order.order_code.ilike(f"%{description.strip()}%"))
+                select(Order)
+                .where(
+                    func.strpos(func.upper(description), func.upper(Order.order_code))
+                    > 0
+                )
+                .limit(2)
             )
-            order = res.scalar_one_or_none()
+            candidates = res.scalars().all()
+            # Ambiguous descriptions must not guess: fall through to UNMATCHED.
+            order = candidates[0] if len(candidates) == 1 else None
 
         # SCENARIO: Unknown order code -> Record unmatched payment
         if not order:

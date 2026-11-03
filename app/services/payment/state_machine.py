@@ -37,6 +37,7 @@ class OrderStateMachine:
     ALLOWED_TRANSITIONS: ClassVar[dict[OrderStatus, set[OrderStatus]]] = {
         OrderStatus.PENDING: {
             OrderStatus.PAID,
+            OrderStatus.COMPLETED,  # operators may complete directly
             OrderStatus.FLAGGED_FOR_REVIEW,
             OrderStatus.EXPIRED,
             OrderStatus.LATE_PAYMENT,

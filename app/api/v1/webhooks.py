@@ -5,7 +5,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.schemas.payment import WebhookEventResponse
-from app.services.payment.payos import FakePayOSProvider
 from app.services.payment.service import PaymentService
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
@@ -26,7 +25,7 @@ async def handle_fake_payos_webhook(
     - Guaranteed idempotent: duplicate webhooks do not trigger multiple order transitions.
     - Handles valid payments, amount discrepancies, late payments, and unmatched orders.
     """
-    provider = FakePayOSProvider()
+    provider = PaymentService.get_provider("fake_payos")
     return await PaymentService.process_webhook(
         db=db,
         provider=provider,

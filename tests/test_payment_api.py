@@ -398,3 +398,123 @@ async def test_second_payment_is_flagged(
     assert resp.status_code == 200
     assert resp.json()["status"] == "DUPLICATE_PAYMENT"
     assert resp.json()["order_status"] == held_status  # never silently moved to PAID
+
+
+# 12. Description matching: "PAY <order_code>" must find the order
+async def test_description_match_finds_order(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=None,
+        amount=order_data["amount_vnd"],
+        reference="TX_DESC_001",
+        description=f"PAY {order_data['order_code']}",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "PROCESSED"
+    assert resp.json()["order_status"] == "PAID"
+
+
+@pytest.mark.parametrize("description", ["%", "_", "%%%"])
+async def test_wildcard_description_does_not_match_or_500(
+    client: AsyncClient, seed_data: dict, description: str
+):
+    await create_test_order(client, seed_data)
+    await create_test_order(client, seed_data)
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=None,
+        amount=70000,
+        reference=f"TX_WILD_{len(description)}",
+        description=description,
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "UNMATCHED"
+
+
+# 13. Legacy order without numeric code gets a persisted one
+async def test_legacy_order_numeric_code_is_persisted(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    headers = {"Authorization": f"Bearer {seed_data['token']}"}
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    order.numeric_order_code = None
+    await db_session.commit()
+
+    r = await client.post(
+        f"/api/v1/orders/{order_data['id']}/payments", headers=headers
+    )
+    assert r.status_code == 201
+
+    await db_session.refresh(order)
+    assert order.numeric_order_code is not None
+
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order.numeric_order_code,
+        amount=order.amount_vnd,
+        reference="TX_LEGACY_001",
+    )
+    wh = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert wh.json()["status"] == "PROCESSED"
+
+
+# 14. Operators can complete a PENDING order directly
+async def test_operator_can_complete_pending_order(
+    client: AsyncClient, seed_data: dict
+):
+    order_data = await create_test_order(client, seed_data)
+    headers = {"Authorization": f"Bearer {seed_data['token']}"}
+    r = await client.patch(
+        f"/api/v1/orders/{order_data['id']}",
+        json={"status": "COMPLETED"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "COMPLETED"
+
+
+# 15. Malformed amounts are rejected with 400
+@pytest.mark.parametrize("bad_amount", ["12.5", None, "abc", -5, True, 12.5])
+async def test_bad_amount_rejected(client: AsyncClient, seed_data: dict, bad_amount):
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    payload = provider.create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=bad_amount,
+        reference="TX_BADAMT",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 400
+
+
+async def test_missing_amount_rejected(client: AsyncClient, seed_data: dict):
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    data = {
+        "orderCode": order_data["numeric_order_code"],
+        "reference": "TX_NOAMT",
+        "code": "00",
+    }
+    payload = provider.create_signed_webhook_payload(data=data)
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 400
+
+
+# 16. Status filter must not treat % and _ as wildcards
+async def test_status_filter_wildcards_not_expanded(
+    client: AsyncClient, seed_data: dict
+):
+    await create_test_order(client, seed_data)
+    headers = {"Authorization": f"Bearer {seed_data['token']}"}
+    r = await client.get("/api/v1/orders", params={"status": "%"}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["total"] == 0
+    r = await client.get(
+        "/api/v1/orders", params={"status": "pending"}, headers=headers
+    )
+    assert r.status_code == 200

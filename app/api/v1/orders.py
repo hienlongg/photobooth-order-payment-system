@@ -219,7 +219,7 @@ async def list_orders(
     base_filters = [Order.tenant_id == current_user.tenant_id]
 
     if status_filter:
-        base_filters.append(Order.status.ilike(status_filter))
+        base_filters.append(func.upper(Order.status) == status_filter.strip().upper())
     if machine_id:
         base_filters.append(Order.machine_id == machine_id)
 
