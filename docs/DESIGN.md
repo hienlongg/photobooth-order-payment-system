@@ -373,7 +373,7 @@ graph TD
 
 3. **Application Services:**
    - **`Order Orchestrator Service`:** Validates machine operational availability (`machine.status == 'online'`), verifies package catalog validity, enforces server-authoritative pricing against client tampering, and retries unique `order_code` collisions using database savepoints.
-   - **`Webhook Processing Service`:** Receives raw webhook payloads, computes and validates HMAC-SHA256 signatures, acquires pessimistic database row locks (`SELECT ... FOR UPDATE`), records immutable `PaymentEvent` entries, and executes safe state transitions.
+   - **`Webhook Processing Service`:** Receives raw webhook payloads, computes and validates HMAC-SHA256 signatures, strictly validates the amount (400 on malformed), ignores provider-reported failures (`code != "00"`), matches orders by numeric code / order code / description (never by wildcard; ambiguous matches are `UNMATCHED`), acquires pessimistic database row locks (`SELECT ... FOR UPDATE` with `populate_existing` so the post-lock status is fresh), records immutable `PaymentEvent` entries, and executes safe state transitions (disallowed transitions are recorded as `REJECTED`, never a 500).
 
 4. **Domain Engines:**
    - **`OrderStateMachine` (`services/order_state.py`):** Pure deterministic state transition engine enforcing valid transitions (`PENDING -> PAID`, `PENDING -> EXPIRED`, etc.) and preventing illegal mutations on terminal states.
@@ -520,7 +520,7 @@ To capture architecturally significant choices made during the engineering lifec
 | **ADR** | **ADR-002: Dual-Table Ledger Architecture and Pessimistic Row Locking for Webhook Idempotency** |
 | **Status** | **Accepted** |
 | **Context** | External payment facilitators (PayOS, Napas 24/7) operate under an "at-least-once" delivery policy. Network jitter, gateway timeouts, or user retries cause identical payment webhooks to arrive concurrently (within milliseconds) or sequentially. Without strict idempotency guards, race conditions cause orders to be fulfilled twice, physical photo sessions to double-trigger, or financial audit records to become corrupt. |
-| **Decision** | Implement a **Dual-Table Ledger Architecture** with **Database-Level Pessimistic Locking (`SELECT ... FOR UPDATE`)** and **Unique Reference Constraints**:<br>1. Separate outbound intent (`payments` table) from inbound immutable audit events (`payment_events` table).<br>2. Enforce composite unique constraint `UniqueConstraint("provider", "reference", name="uq_payment_events_provider_reference")` on PostgreSQL. Concurrent duplicate writes fail with `IntegrityError` (code 23505) and roll back safely.<br>3. Webhook worker locks target order via `SELECT * FROM orders WHERE order_code = :code FOR UPDATE`.<br>4. Guard transitions via deterministic `OrderStateMachine` (`PENDING -> PAID -> COMPLETED`). Re-transitions on `PAID` orders act as idempotent no-ops returning HTTP 200 OK. |
+| **Decision** | Implement a **Dual-Table Ledger Architecture** with **Database-Level Pessimistic Locking (`SELECT ... FOR UPDATE`)** and **Unique Reference Constraints**:<br>1. Separate outbound intent (`payments` table) from inbound immutable audit events (`payment_events` table).<br>2. Enforce composite unique constraint `UniqueConstraint("provider", "reference", name="uq_payment_events_provider_reference")` on PostgreSQL. Concurrent duplicate writes fail with `IntegrityError` (code 23505) and roll back safely.<br>3. Webhook worker locks target order via `SELECT * FROM orders WHERE id = :id FOR UPDATE` using `populate_existing` so a session-cached stale `status` can never be trusted after waiting on the lock.<br>4. Guard transitions via deterministic `OrderStateMachine` (`PENDING -> PAID -> COMPLETED`). A different-reference payment on an order that already holds money is recorded as `DUPLICATE_PAYMENT` without any transition; transitions the state machine forbids are recorded as `REJECTED` (HTTP 200) rather than failing. |
 | **Alternatives considered** | 1. **Single-Table Mutation (Mutating `orders.status` directly):** Simpler schema, but zero immutable historical audit trail; impossible to reconstruct dispute logs or detect underpayments/overpayments.<br>2. **Distributed Redis Lock (Redlock):** Fast in-memory locking, but introduces distributed system split-brain failure modes; Redis is not the financial source of truth; database ACID locks guarantee absolute consistency.<br>3. **Application In-Memory Lock (`asyncio.Lock`):** Single-process only; fails across multi-worker Uvicorn configurations or horizontally scaled cloud replicas. |
 | **Consequences** | • 100% mathematical guarantee of webhook idempotency and zero duplicate order fulfillment under concurrent bursts.<br>• Complete forensic audit trail preserving raw JSON payloads, signature validation booleans, timestamps, and error messages.<br>• Duplicate webhooks acknowledge with HTTP 200/202 `{ status: "DUPLICATE" }`, preventing external gateway retry storms.<br>• *Trade-off:* `SELECT ... FOR UPDATE` acquires a row lock for the transaction duration (~10–25 ms). Strict design rule: no external HTTP/network calls are permitted while holding the database transaction lock. |
 
@@ -1063,7 +1063,7 @@ The following specifications detail the 8 core domain and service classes implem
 | 5 | `reference` | `str` | Public (`+`) | String(100), NOT NULL | Gateway transaction reference ID. |
 | 6 | `order_code` | `str | None` | Public (`+`) | String(50), NULLABLE, INDEX | Order code transmitted in webhook payload. |
 | 7 | `amount_vnd` | `int` | Public (`+`) | Integer, NOT NULL | Actual settled money amount reported by bank. |
-| 8 | `status` | `str` | Public (`+`) | String(30), NOT NULL | `PROCESSED`, `DUPLICATE`, `FLAGGED_FOR_REVIEW`, `LATE_PAYMENT`, `UNMATCHED`, `REJECTED`. |
+| 8 | `status` | `str` | Public (`+`) | String(30), NOT NULL | `PROCESSED`, `DUPLICATE`, `DUPLICATE_PAYMENT`, `FAILED`, `FLAGGED_FOR_REVIEW`, `LATE_PAYMENT`, `UNMATCHED`, `REJECTED`. |
 | 9 | `is_valid_signature` | `bool` | Public (`+`) | Boolean, NOT NULL | True if webhook passed HMAC-SHA256 signature verification. |
 | 10 | `raw_payload` | `dict` | Public (`+`) | JSONB, NOT NULL | Complete, unmodified raw JSON webhook body. |
 | 11 | `error_message` | `str | None` | Public (`+`) | Text, NULLABLE | Descriptive diagnostic log for anomalies or validation failures. |
@@ -1071,7 +1071,7 @@ The following specifications detail the 8 core domain and service classes implem
 #### Operation Table
 | # | Operation | Parameters / Return | Visibility | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| 1 | `is_duplicate` | `() -> bool` | Public (`+`) | Returns `True` if `status == 'DUPLICATE'`. |
+| 1 | `is_duplicate` | `() -> bool` | Public (`+`) | Returns `True` if `status` is `DUPLICATE` (same reference replayed). A different-reference second transfer is `DUPLICATE_PAYMENT`. |
 | 2 | `mark_processed` | `() -> void` | Public (`+`) | Sets event status to `PROCESSED` upon successful state machine execution. |
 
 ---
@@ -1212,9 +1212,16 @@ sequenceDiagram
     alt Signature Tampered / Invalid
         WebhookRouter-->>Gateway: HTTP 400 Bad Request ("Invalid HMAC signature")
     else Signature Valid
-        WebhookRouter->>DB: execute(SELECT * FROM orders WHERE order_code = :code FOR UPDATE)
-        Note over DB: Acquires Pessimistic Row Lock on Order Record
-        DB-->>WebhookRouter: order (status: 'PENDING')
+        alt Malformed amount (null / "12.5" / negative)
+            WebhookRouter-->>Gateway: HTTP 400 Bad Request ("Invalid or missing 'amount'")
+        end
+        alt Provider code != "00" (failed payment)
+            WebhookRouter->>DB: INSERT INTO payment_events (status='FAILED') + COMMIT
+            WebhookRouter-->>Gateway: HTTP 200 OK { status: "FAILED" } (order unchanged)
+        end
+        WebhookRouter->>DB: execute(SELECT * FROM orders WHERE id = :id FOR UPDATE, populate_existing)
+        Note over DB: Acquires Pessimistic Row Lock; populate_existing refreshes cached status
+        DB-->>WebhookRouter: order (fresh status, e.g. 'PENDING')
 
         alt Webhook A reaches DB Insert First
             WebhookRouter->>DB: INSERT INTO payment_events (reference='TXN-001', status='PROCESSED')
@@ -1232,7 +1239,48 @@ sequenceDiagram
             WebhookRouter->>DB: ROLLBACK Transaction
             WebhookRouter-->>Gateway: HTTP 200 OK { status: "DUPLICATE", message: "Transaction already processed" }
         end
+
+        alt Webhook C arrives with a DIFFERENT reference 'TXN-002' after the order is PAID
+            Note over WebhookRouter: Lock wait ends; populate_existing shows status 'PAID'
+            WebhookRouter->>DB: INSERT INTO payment_events (reference='TXN-002', status='DUPLICATE_PAYMENT')
+            WebhookRouter->>DB: COMMIT (order unchanged)
+            WebhookRouter-->>Gateway: HTTP 200 OK { status: "DUPLICATE_PAYMENT" }
+        end
+
+        alt Required transition forbidden (order CANCELLED / COMPLETED, EXPIRED + wrong amount)
+            WebhookRouter->>SM: can_transition(order.status, target)
+            SM-->>WebhookRouter: false
+            WebhookRouter->>DB: INSERT INTO payment_events (status='REJECTED') + COMMIT
+            WebhookRouter-->>Gateway: HTTP 200 OK { status: "REJECTED" }
+        end
     end
+```
+
+#### Webhook Decision Flow
+Evaluated in this order after signature verification and strict amount parsing:
+
+```mermaid
+flowchart TD
+    Start([Signed webhook]) --> Dup{Reference already in payment_events?}
+    Dup -- Yes --> D1[200 DUPLICATE]
+    Dup -- No --> Find{Order found? numeric code, order code, then description contains order code}
+    Find -- No or ambiguous --> U[Record UNMATCHED, 200]
+    Find -- Yes --> Failed{Provider code == 00?}
+    Failed -- No --> F[Record FAILED, order unchanged, 200]
+    Failed -- Yes --> Lock[SELECT FOR UPDATE + populate_existing]
+    Lock --> Held{Status in PAID, COMPLETED, LATE_PAYMENT, FLAGGED_FOR_REVIEW?}
+    Held -- Yes --> DP[Record DUPLICATE_PAYMENT, no transition, 200]
+    Held -- No --> Amt{Amount == order amount?}
+    Amt -- No --> Flag[Target FLAGGED_FOR_REVIEW]
+    Amt -- Yes --> Exp{Expired?}
+    Exp -- Yes --> Late[Target LATE_PAYMENT]
+    Exp -- No --> Paid[Target PAID]
+    Flag --> Allowed{Transition allowed?}
+    Late --> Allowed
+    Paid --> Allowed
+    Allowed -- No --> Rej[Record REJECTED, no transition, 200]
+    Allowed -- Yes --> Ok[Insert event, transition, commit]
+    Ok -. unique violation .-> D1
 ```
 
 ---
@@ -1319,7 +1367,9 @@ The state of an `Order` governs kiosk hardware actions, payment acceptance, and 
 stateDiagram-v2
     [*] --> PENDING : Kiosk creates order (POST /orders)
 
-    PENDING --> PAID : Valid Webhook received (amount matches, signature valid)
+    PENDING --> PAID : Valid Webhook received (amount matches, signature valid, provider code 00)
+    PENDING --> COMPLETED : Operator completes order directly (PATCH /orders/{id})
+    PENDING --> LATE_PAYMENT : Webhook received after expires_at
     PENDING --> EXPIRED : Polling sweep detects elapsed time > 10 min
     PENDING --> CANCELLED : Customer presses cancel on touchscreen
     PENDING --> FLAGGED_FOR_REVIEW : Webhook received with amount mismatch
@@ -1345,11 +1395,16 @@ stateDiagram-v2
 | Current State | Proposed State | Trigger / Guard Condition | System Action / Side Effect |
 | :--- | :--- | :--- | :--- |
 | `PENDING` | `PAID` | Webhook signature valid AND `webhook_amount == order.amount_vnd` AND `now < order.expires_at` | Sets `order.paid_at`, marks `PaymentEvent` as `PROCESSED`, unlocks kiosk. |
+| `PENDING` | `COMPLETED` | Operator `PATCH /orders/{id}` with `status=COMPLETED` | Direct completion without a payment event (manual/cash override). |
+| `PENDING` | `LATE_PAYMENT` | Webhook valid AND `now > order.expires_at` | Marks `PaymentEvent` as `LATE_PAYMENT`, flags for human review. |
 | `PENDING` | `FLAGGED_FOR_REVIEW` | Webhook signature valid AND `webhook_amount != order.amount_vnd` | Marks `PaymentEvent` as `FLAGGED_FOR_REVIEW`, alerts franchise admin. |
 | `PENDING` | `EXPIRED` | System time > `order.expires_at` (10 minutes elapsed) | Disables active VietQR code on kiosk display. |
 | `PENDING` | `CANCELLED` | Customer presses cancel OR kiosk hardware disconnects | Releases machine state to `online`. |
 | `EXPIRED` | `LATE_PAYMENT` | Webhook arrives referencing expired order | Logs audit event with status `LATE_PAYMENT`, flags for human review. |
 | `PAID` | `COMPLETED` | Kiosk reports print job successfully finished | Increments kiosk print counter, ends transaction lifecycle. |
+| `PAID` / `COMPLETED` / `LATE_PAYMENT` / `FLAGGED_FOR_REVIEW` | *(no transition)* | A second valid webhook with a **different** reference arrives | Order is untouched; `PaymentEvent` recorded as `DUPLICATE_PAYMENT` (possible double charge). |
+| `CANCELLED` / `COMPLETED` / `EXPIRED` (wrong amount) | *(no transition)* | Webhook arrives but the state machine forbids the required transition | Order is untouched; `PaymentEvent` recorded as `REJECTED` with reason for manual review. HTTP 200. |
+| *Any* | *(no transition)* | Webhook `code != "00"` (provider-reported failure) | `PaymentEvent` recorded as `FAILED`; order unchanged. |
 | `COMPLETED` | *None* | Terminal state; no transitions permitted | N/A |
 | `CANCELLED` | *None* | Terminal state; no transitions permitted | N/A |
 
