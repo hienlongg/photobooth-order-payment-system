@@ -19,7 +19,21 @@ from app.schemas.payment import (
 )
 from app.services.payment.base import PaymentProvider, PaymentRequestData
 from app.services.payment.payos import FakePayOSProvider
-from app.services.payment.state_machine import OrderStateMachine, OrderStatus
+from app.services.payment.state_machine import (
+    InvalidOrderStateTransitionError,
+    OrderStateMachine,
+    OrderStatus,
+)
+
+# Statuses in which the order has already received (or is holding) customer money.
+ALREADY_PAID_STATUSES = frozenset(
+    {
+        OrderStatus.PAID,
+        OrderStatus.COMPLETED,
+        OrderStatus.LATE_PAYMENT,
+        OrderStatus.FLAGGED_FOR_REVIEW,
+    }
+)
 
 
 class PaymentService:
@@ -139,6 +153,9 @@ class PaymentService:
         amount_received = int(data.get("amount", 0))
         reference = str(data.get("reference") or data.get("paymentLinkId") or "")
         description = str(data.get("description", ""))
+        # PayOS success code is "00"; anything else means the payment did not succeed.
+        provider_code = str(data.get("code") or raw_payload.get("code") or "00")
+        payment_failed = provider_code != "00"
 
         if not reference:
             raise HTTPException(
@@ -166,9 +183,7 @@ class PaymentService:
             # Check numeric match
             if isinstance(order_code_raw, int) or str(order_code_raw).isdigit():
                 res = await db.execute(
-                    select(Order).where(
-                        Order.numeric_order_code == int(order_code_raw)
-                    )
+                    select(Order).where(Order.numeric_order_code == int(order_code_raw))
                 )
                 order = res.scalar_one_or_none()
 
@@ -216,30 +231,73 @@ class PaymentService:
                 message=f"Order '{order_code_raw}' not found. Payment recorded as unmatched.",
             )
 
-        # 4. Acquire Row-Level Lock on Order (SELECT ... FOR UPDATE)
+        # SCENARIO: Gateway reports a failed/cancelled payment -> record only, never pay
+        if payment_failed:
+            event = PaymentEvent(
+                tenant_id=order.tenant_id,
+                order_id=order.id,
+                provider=provider.provider_name,
+                reference=reference,
+                order_code=order.order_code,
+                amount_vnd=amount_received,
+                status="FAILED",
+                is_valid_signature=True,
+                raw_payload=raw_payload,
+                error_message=(
+                    f"Provider reported failure: code={provider_code}, "
+                    f"desc={data.get('desc') or raw_payload.get('desc')}"
+                ),
+            )
+            try:
+                async with db.begin_nested():
+                    db.add(event)
+                    await db.flush()
+                await db.commit()
+            except IntegrityError:
+                return WebhookEventResponse(
+                    status="DUPLICATE",
+                    message="Duplicate webhook event caught by unique constraint",
+                    order_id=order.id,
+                    order_status=order.status,
+                    is_duplicate=True,
+                )
+            return WebhookEventResponse(
+                status="FAILED",
+                message="Provider reported a failed payment; order unchanged.",
+                order_id=order.id,
+                order_status=order.status,
+                is_duplicate=False,
+            )
+
+        # 4. Acquire Row-Level Lock on Order (SELECT ... FOR UPDATE).
+        # populate_existing() refreshes the identity-mapped instance with the locked
+        # row; without it a stale cached `status` would be returned after waiting.
         locked_order_res = await db.execute(
-            select(Order).where(Order.id == order.id).with_for_update()
+            select(Order)
+            .where(Order.id == order.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         order = locked_order_res.scalar_one()
 
-        # Double check: Is order already paid?
         current_status = OrderStateMachine.normalize_status(order.status)
-        if current_status == OrderStatus.PAID:
-            return WebhookEventResponse(
-                status="DUPLICATE",
-                message="Order is already paid. Duplicate transition avoided.",
-                order_id=order.id,
-                order_status=order.status,
-                is_duplicate=True,
-            )
-
         now = datetime.datetime.now(datetime.UTC)
-        target_status = OrderStatus.PAID
+        target_status: OrderStatus | None = OrderStatus.PAID
         event_status = "PROCESSED"
         err_msg = None
 
+        if current_status in ALREADY_PAID_STATUSES:
+            # SCENARIO: Order already holds money (distinct reference) -> double payment.
+            # Never transition again; record the event so it can be reviewed/refunded.
+            target_status = None
+            event_status = "DUPLICATE_PAYMENT"
+            err_msg = (
+                f"Additional payment received for order already in status "
+                f"'{current_status.value}' (possible double charge)"
+            )
+
         # SCENARIO: Wrong amount -> Flag for review
-        if amount_received != order.amount_vnd:
+        elif amount_received != order.amount_vnd:
             target_status = OrderStatus.FLAGGED_FOR_REVIEW
             event_status = "FLAGGED_FOR_REVIEW"
             err_msg = f"Amount mismatch: expected {order.amount_vnd} VND, received {amount_received} VND"
@@ -251,6 +309,19 @@ class PaymentService:
             target_status = OrderStatus.LATE_PAYMENT
             event_status = "LATE_PAYMENT"
             err_msg = "Payment received after order expiration timeout"
+
+        # SCENARIO: Transition not allowed (CANCELLED order, EXPIRED + wrong amount, ...)
+        # Keep the money trail for manual review instead of returning 500.
+        if target_status is not None and not OrderStateMachine.can_transition(
+            order.status, target_status
+        ):
+            err_msg = (
+                f"Payment of {amount_received} VND received but order in status "
+                f"'{current_status.value}' cannot move to '{target_status.value}'; "
+                f"manual review required"
+            )
+            target_status = None
+            event_status = "REJECTED"
 
         # 5. Insert PaymentEvent protected by nested transaction (Savepoint)
         event = PaymentEvent(
@@ -272,34 +343,47 @@ class PaymentService:
                 await db.flush()
         except IntegrityError:
             # PostgreSQL caught concurrent insert with identical (provider, reference)
+            order_id, order_status = order.id, order.status
+            await db.rollback()  # release the row lock (expires loaded instances)
             return WebhookEventResponse(
                 status="DUPLICATE",
                 message="Duplicate webhook event caught by unique constraint",
-                order_id=order.id,
-                order_status=order.status,
+                order_id=order_id,
+                order_status=order_status,
                 is_duplicate=True,
             )
 
         # 6. Apply state transition via OrderStateMachine
-        OrderStateMachine.transition(order, target_status)
+        if target_status is not None:
+            try:
+                OrderStateMachine.transition(order, target_status)
+            except InvalidOrderStateTransitionError as exc:
+                # Defensive: the pre-check should prevent this, but never lose the event.
+                event.status = "REJECTED"
+                event.error_message = str(exc)
+                event_status = "REJECTED"
+                err_msg = str(exc)
+                target_status = None
+
         if target_status == OrderStatus.PAID:
             order.paid_at = now
 
         # Update associated Payment record if present
-        p_res = await db.execute(
-            select(Payment)
-            .where(Payment.order_id == order.id)
-            .order_by(Payment.created_at.desc())
-        )
-        payment = p_res.scalars().first()
-        if payment:
-            payment.status = target_status.value
+        if target_status is not None:
+            p_res = await db.execute(
+                select(Payment)
+                .where(Payment.order_id == order.id)
+                .order_by(Payment.created_at.desc())
+            )
+            payment = p_res.scalars().first()
+            if payment:
+                payment.status = target_status.value
 
         await db.commit()
 
         return WebhookEventResponse(
             status=event_status,
-            message="Webhook processed successfully",
+            message=err_msg or "Webhook processed successfully",
             order_id=order.id,
             order_status=order.status,
             is_duplicate=False,

@@ -3,6 +3,8 @@ from collections.abc import AsyncGenerator
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -20,9 +22,62 @@ from app.models.package import Package
 from app.models.tenant import Tenant
 from app.models.user import User
 
+
+def _resolve_test_database_url() -> URL:
+    """Test DB URL; refuses to run against anything that isn't clearly a test database."""
+    raw = settings.TEST_DATABASE_URL or make_url(settings.SQLALCHEMY_DATABASE_URI).set(
+        database=f"{settings.POSTGRES_DB}_test"
+    ).render_as_string(hide_password=False)
+    url = make_url(raw)
+    dev_url = make_url(settings.SQLALCHEMY_DATABASE_URI)
+    if (
+        not url.database
+        or not url.database.endswith("_test")
+        or (url.host, url.port, url.database)
+        == (dev_url.host, dev_url.port, dev_url.database)
+    ):
+        raise RuntimeError(
+            f"Refusing to run tests against database '{url.database}': tests drop all "
+            "tables. Set TEST_DATABASE_URL to a dedicated database whose name ends in "
+            "'_test' (and differs from the dev database)."
+        )
+    return url
+
+
+TEST_DATABASE_URL = _resolve_test_database_url()
+
+
+_test_db_ready = False
+
+
+async def ensure_test_database() -> None:
+    """Creates the dedicated test database on the server if it doesn't exist yet."""
+    global _test_db_ready
+    if _test_db_ready:
+        return
+    admin_engine = create_async_engine(
+        TEST_DATABASE_URL.set(database="postgres"),
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+    )
+    try:
+        async with admin_engine.connect() as conn:
+            exists = await conn.scalar(
+                text("SELECT 1 FROM pg_database WHERE datname = :n"),
+                {"n": TEST_DATABASE_URL.database},
+            )
+            if not exists:
+                await conn.execute(
+                    text(f'CREATE DATABASE "{TEST_DATABASE_URL.database}"')
+                )
+    finally:
+        await admin_engine.dispose()
+    _test_db_ready = True
+
+
 # Use NullPool in tests to prevent asyncpg connections from being shared across closed event loops
 test_engine = create_async_engine(
-    settings.SQLALCHEMY_DATABASE_URI,
+    TEST_DATABASE_URL,
     poolclass=NullPool,
     echo=False,
 )
@@ -58,6 +113,8 @@ async def init_test_db(request):
     ):
         yield
         return
+
+    await ensure_test_database()
 
     # Apply override for FastAPI dependency
     app.dependency_overrides[get_db] = override_get_db

@@ -56,9 +56,7 @@ class Payment(Base, TimestampMixin):
     )
     order_code: Mapped[str] = mapped_column(String(50), nullable=False)
     amount_vnd: Mapped[int] = mapped_column(Integer, nullable=False)
-    status: Mapped[str] = mapped_column(
-        String(30), default="PENDING", nullable=False
-    )
+    status: Mapped[str] = mapped_column(String(30), default="PENDING", nullable=False)
     checkout_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     qr_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     account_number: Mapped[str | None] = mapped_column(String(50), nullable=True)

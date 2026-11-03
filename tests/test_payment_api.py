@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -251,3 +252,149 @@ async def test_concurrency_challenge_identical_webhooks(
     ).scalar_one()
     assert order.status == "PAID"
     assert order.paid_at is not None
+
+
+# 8. CHALLENGE: Two webhooks with DIFFERENT references for the same order, concurrently
+async def test_concurrency_challenge_different_references(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    """
+    Two distinct, valid transfers race for one order. Exactly one may pay the order;
+    the other must be recorded as a DUPLICATE_PAYMENT (not a second PROCESSED).
+    """
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    payloads = [
+        provider.create_signed_webhook_payload(
+            order_code=order_data["numeric_order_code"],
+            amount=order_data["amount_vnd"],
+            reference=ref,
+        )
+        for ref in ("TX_RACE_A", "TX_RACE_B")
+    ]
+
+    resps = await asyncio.gather(
+        *(client.post("/api/v1/webhooks/fake", json=p) for p in payloads)
+    )
+    assert all(r.status_code == 200 for r in resps)
+    assert sorted(r.json()["status"] for r in resps) == [
+        "DUPLICATE_PAYMENT",
+        "PROCESSED",
+    ]
+
+    events = (
+        (
+            await db_session.execute(
+                select(PaymentEvent).where(PaymentEvent.order_id == order_data["id"])
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(events) == 2
+    assert sorted(e.status for e in events) == ["DUPLICATE_PAYMENT", "PROCESSED"]
+
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    assert order.status == "PAID"
+
+
+# 9. Failed payment code must never mark the order as paid
+async def test_failed_provider_code_does_not_pay(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference="TX_FAILED_001",
+        code="01",
+        desc="failed",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "FAILED"
+    assert resp.json()["order_status"] == "PENDING"
+
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    assert order.status == "PENDING"
+    assert order.paid_at is None
+
+
+# 10. Payment on a closed order: 200 + event kept, no 500
+@pytest.mark.parametrize("closed_status", ["CANCELLED", "COMPLETED"])
+async def test_payment_on_closed_order_is_recorded(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession, closed_status: str
+):
+    order_data = await create_test_order(client, seed_data)
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    order.status = closed_status
+    await db_session.commit()
+
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference=f"TX_CLOSED_{closed_status}",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["is_duplicate"] is False
+    assert resp.json()["order_status"] == closed_status
+
+    event = (
+        await db_session.execute(
+            select(PaymentEvent).where(
+                PaymentEvent.reference == f"TX_CLOSED_{closed_status}"
+            )
+        )
+    ).scalar_one()
+    assert event.status in {"REJECTED", "DUPLICATE_PAYMENT"}
+
+
+async def test_wrong_amount_on_expired_order_is_recorded(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    order.status = "EXPIRED"
+    await db_session.commit()
+
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=1000,
+        reference="TX_EXPIRED_WRONG_AMT",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "REJECTED"
+    assert resp.json()["order_status"] == "EXPIRED"
+
+
+# 11. Second distinct payment on already-paid / held orders is flagged
+@pytest.mark.parametrize("held_status", ["PAID", "LATE_PAYMENT", "FLAGGED_FOR_REVIEW"])
+async def test_second_payment_is_flagged(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession, held_status: str
+):
+    order_data = await create_test_order(client, seed_data)
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    order.status = held_status
+    await db_session.commit()
+
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference=f"TX_SECOND_{held_status}",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "DUPLICATE_PAYMENT"
+    assert resp.json()["order_status"] == held_status  # never silently moved to PAID

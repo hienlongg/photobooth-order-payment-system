@@ -81,6 +81,9 @@ def test_hmac_signature_invalid_signature_string(provider: FakePayOSProvider):
         reference="TX_TEST_001",
     )
 
-    assert provider.verify_webhook_signature(payload["data"], "wrong_hex_signature") is False
+    assert (
+        provider.verify_webhook_signature(payload["data"], "wrong_hex_signature")
+        is False
+    )
     assert provider.verify_webhook_signature(payload["data"], "") is False
     assert provider.verify_webhook_signature(payload["data"], None) is False

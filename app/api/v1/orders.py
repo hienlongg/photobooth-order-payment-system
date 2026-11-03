@@ -120,7 +120,9 @@ async def create_order(
     max_retries = 3
     new_order = None
     now = datetime.datetime.now(datetime.UTC)
-    expires_at = now + datetime.timedelta(minutes=settings.ORDER_PAYMENT_TIMEOUT_MINUTES)
+    expires_at = now + datetime.timedelta(
+        minutes=settings.ORDER_PAYMENT_TIMEOUT_MINUTES
+    )
 
     for attempt in range(max_retries):
         numeric_code = secrets.randbelow(900_000_000) + 100_000_000

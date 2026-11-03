@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     PAYOS_CHECKSUM_KEY: str = "fake_payos_checksum_key_for_testing"
     ORDER_PAYMENT_TIMEOUT_MINUTES: int = 15
 
+    # Dedicated database used ONLY by the test suite (tests drop/create all tables).
+    # Defaults to "<POSTGRES_DB>_test" on the same server when unset.
+    TEST_DATABASE_URL: str | None = None
+
     @computed_field
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:
