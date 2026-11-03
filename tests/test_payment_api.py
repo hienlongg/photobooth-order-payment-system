@@ -1,0 +1,520 @@
+import asyncio
+import datetime
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.order import Order
+from app.models.payment import PaymentEvent
+from app.services.payment.payos import FakePayOSProvider
+
+
+async def create_test_order(
+    client: AsyncClient, seed_data: dict, price_vnd: int = 70000
+) -> dict:
+    headers = {"Authorization": f"Bearer {seed_data['token']}"}
+    payload = {
+        "machine_id": str(seed_data["machine"].id),
+        "package_id": str(seed_data["package"].id),
+        "amount_vnd": price_vnd,
+    }
+    resp = await client.post("/api/v1/orders", json=payload, headers=headers)
+    assert resp.status_code == 201
+    return resp.json()
+
+
+# 1. SCENARIO: Valid payment -> PENDING to PAID
+async def test_scenario_valid_payment(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    order_id = order_data["id"]
+    headers = {"Authorization": f"Bearer {seed_data['token']}"}
+
+    # Generate payment request
+    p_resp = await client.post(f"/api/v1/orders/{order_id}/payments", headers=headers)
+    assert p_resp.status_code == 201
+    payment_info = p_resp.json()
+    assert payment_info["checkout_url"] is not None
+    assert payment_info["qr_code"] is not None
+    assert payment_info["status"] == "PENDING"
+
+    # Send valid signed webhook
+    provider = FakePayOSProvider()
+    webhook_payload = provider.create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference="TX_VALID_001",
+        description=order_data["order_code"],
+    )
+    wh_resp = await client.post("/api/v1/webhooks/fake", json=webhook_payload)
+    assert wh_resp.status_code == 200
+    assert wh_resp.json()["status"] == "PROCESSED"
+    assert wh_resp.json()["order_status"] == "PAID"
+
+    # Verify status endpoint
+    status_resp = await client.get(
+        f"/api/v1/orders/{order_id}/payment-status", headers=headers
+    )
+    assert status_resp.status_code == 200
+    assert status_resp.json()["is_paid"] is True
+    assert status_resp.json()["order_status"] == "PAID"
+    assert status_resp.json()["paid_at"] is not None
+    assert status_resp.json()["events_count"] == 1
+
+
+# 2. SCENARIO: Same webhook twice -> Only one payment transition
+async def test_scenario_same_webhook_twice(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    webhook_payload = provider.create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference="TX_DUPLICATE_001",
+    )
+
+    # First delivery
+    r1 = await client.post("/api/v1/webhooks/fake", json=webhook_payload)
+    assert r1.status_code == 200
+    assert r1.json()["status"] == "PROCESSED"
+    assert r1.json()["is_duplicate"] is False
+
+    # Replay delivery (Same webhook)
+    r2 = await client.post("/api/v1/webhooks/fake", json=webhook_payload)
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "DUPLICATE"
+    assert r2.json()["is_duplicate"] is True
+
+    # Check database: Exactly one payment event
+    events = (
+        (
+            await db_session.execute(
+                select(PaymentEvent).where(PaymentEvent.reference == "TX_DUPLICATE_001")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(events) == 1
+
+
+# 3. SCENARIO: Invalid signature -> Reject webhook
+async def test_scenario_invalid_signature(client: AsyncClient, seed_data: dict):
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    webhook_payload = provider.create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference="TX_TAMPERED_001",
+    )
+    # Tamper with the signature
+    webhook_payload["signature"] = "deadbeef" * 8
+
+    resp = await client.post("/api/v1/webhooks/fake", json=webhook_payload)
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Invalid webhook signature"
+
+
+# 4. SCENARIO: Wrong amount -> Flag for review
+async def test_scenario_wrong_amount(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    # Expected: 70,000 VND; Webhook sends: 50,000 VND (underpayment)
+    webhook_payload = provider.create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=50000,
+        reference="TX_UNDERPAID_001",
+    )
+
+    resp = await client.post("/api/v1/webhooks/fake", json=webhook_payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "FLAGGED_FOR_REVIEW"
+    assert resp.json()["order_status"] == "FLAGGED_FOR_REVIEW"
+
+    # Check database
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    assert order.status == "FLAGGED_FOR_REVIEW"
+
+
+# 5. SCENARIO: Expired order paid -> LATE_PAYMENT
+async def test_scenario_expired_order_paid(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    order_id = order_data["id"]
+
+    # Manually backdate expires_at in the database to simulate expiration
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_id))
+    ).scalar_one()
+    order.expires_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+        minutes=5
+    )
+    await db_session.commit()
+
+    provider = FakePayOSProvider()
+    webhook_payload = provider.create_signed_webhook_payload(
+        order_code=order.numeric_order_code,
+        amount=order.amount_vnd,
+        reference="TX_LATE_001",
+    )
+
+    resp = await client.post("/api/v1/webhooks/fake", json=webhook_payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "LATE_PAYMENT"
+    assert resp.json()["order_status"] == "LATE_PAYMENT"
+
+    # Check database
+    await db_session.refresh(order)
+    assert order.status == "LATE_PAYMENT"
+
+
+# 6. SCENARIO: Unknown order code -> Record unmatched payment
+async def test_scenario_unknown_order_code(
+    client: AsyncClient, db_session: AsyncSession
+):
+    provider = FakePayOSProvider()
+    webhook_payload = provider.create_signed_webhook_payload(
+        order_code=999999999,  # Non-existent order code
+        amount=70000,
+        reference="TX_UNMATCHED_001",
+    )
+
+    resp = await client.post("/api/v1/webhooks/fake", json=webhook_payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "UNMATCHED"
+
+    # Verify event stored in DB with order_id = None
+    event = (
+        await db_session.execute(
+            select(PaymentEvent).where(PaymentEvent.reference == "TX_UNMATCHED_001")
+        )
+    ).scalar_one()
+    assert event.order_id is None
+    assert event.status == "UNMATCHED"
+
+
+# 7. CHALLENGE: Send two identical webhooks concurrently using asyncio.gather()
+async def test_concurrency_challenge_identical_webhooks(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    """
+    Challenge: Send two identical webhooks concurrently using asyncio.gather().
+    Verify that only one payment event is accepted and the order is paid exactly once.
+    """
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    webhook_payload = provider.create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference="TX_CONCURRENT_RACE_001",
+    )
+
+    # Fire two identical webhook requests simultaneously
+    resp1, resp2 = await asyncio.gather(
+        client.post("/api/v1/webhooks/fake", json=webhook_payload),
+        client.post("/api/v1/webhooks/fake", json=webhook_payload),
+    )
+
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+
+    statuses = {resp1.json()["status"], resp2.json()["status"]}
+    # One request must be PROCESSED; the other must be DUPLICATE
+    assert "PROCESSED" in statuses
+    assert "DUPLICATE" in statuses
+
+    # Verify Database Invariant: Exactly one payment event and order paid once
+    events = (
+        (
+            await db_session.execute(
+                select(PaymentEvent).where(
+                    PaymentEvent.reference == "TX_CONCURRENT_RACE_001"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(events) == 1
+    assert events[0].status == "PROCESSED"
+
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    assert order.status == "PAID"
+    assert order.paid_at is not None
+
+
+# 8. CHALLENGE: Two webhooks with DIFFERENT references for the same order, concurrently
+async def test_concurrency_challenge_different_references(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    """
+    Two distinct, valid transfers race for one order. Exactly one may pay the order;
+    the other must be recorded as a DUPLICATE_PAYMENT (not a second PROCESSED).
+    """
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    payloads = [
+        provider.create_signed_webhook_payload(
+            order_code=order_data["numeric_order_code"],
+            amount=order_data["amount_vnd"],
+            reference=ref,
+        )
+        for ref in ("TX_RACE_A", "TX_RACE_B")
+    ]
+
+    resps = await asyncio.gather(
+        *(client.post("/api/v1/webhooks/fake", json=p) for p in payloads)
+    )
+    assert all(r.status_code == 200 for r in resps)
+    assert sorted(r.json()["status"] for r in resps) == [
+        "DUPLICATE_PAYMENT",
+        "PROCESSED",
+    ]
+
+    events = (
+        (
+            await db_session.execute(
+                select(PaymentEvent).where(PaymentEvent.order_id == order_data["id"])
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(events) == 2
+    assert sorted(e.status for e in events) == ["DUPLICATE_PAYMENT", "PROCESSED"]
+
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    assert order.status == "PAID"
+
+
+# 9. Failed payment code must never mark the order as paid
+async def test_failed_provider_code_does_not_pay(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference="TX_FAILED_001",
+        code="01",
+        desc="failed",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "FAILED"
+    assert resp.json()["order_status"] == "PENDING"
+
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    assert order.status == "PENDING"
+    assert order.paid_at is None
+
+
+# 10. Payment on a closed order: 200 + event kept, no 500
+@pytest.mark.parametrize("closed_status", ["CANCELLED", "COMPLETED"])
+async def test_payment_on_closed_order_is_recorded(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession, closed_status: str
+):
+    order_data = await create_test_order(client, seed_data)
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    order.status = closed_status
+    await db_session.commit()
+
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference=f"TX_CLOSED_{closed_status}",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["is_duplicate"] is False
+    assert resp.json()["order_status"] == closed_status
+
+    event = (
+        await db_session.execute(
+            select(PaymentEvent).where(
+                PaymentEvent.reference == f"TX_CLOSED_{closed_status}"
+            )
+        )
+    ).scalar_one()
+    assert event.status in {"REJECTED", "DUPLICATE_PAYMENT"}
+
+
+async def test_wrong_amount_on_expired_order_is_recorded(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    order.status = "EXPIRED"
+    await db_session.commit()
+
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=1000,
+        reference="TX_EXPIRED_WRONG_AMT",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "REJECTED"
+    assert resp.json()["order_status"] == "EXPIRED"
+
+
+# 11. Second distinct payment on already-paid / held orders is flagged
+@pytest.mark.parametrize("held_status", ["PAID", "LATE_PAYMENT", "FLAGGED_FOR_REVIEW"])
+async def test_second_payment_is_flagged(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession, held_status: str
+):
+    order_data = await create_test_order(client, seed_data)
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    order.status = held_status
+    await db_session.commit()
+
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=order_data["amount_vnd"],
+        reference=f"TX_SECOND_{held_status}",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "DUPLICATE_PAYMENT"
+    assert resp.json()["order_status"] == held_status  # never silently moved to PAID
+
+
+# 12. Description matching: "PAY <order_code>" must find the order
+async def test_description_match_finds_order(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=None,
+        amount=order_data["amount_vnd"],
+        reference="TX_DESC_001",
+        description=f"PAY {order_data['order_code']}",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "PROCESSED"
+    assert resp.json()["order_status"] == "PAID"
+
+
+@pytest.mark.parametrize("description", ["%", "_", "%%%"])
+async def test_wildcard_description_does_not_match_or_500(
+    client: AsyncClient, seed_data: dict, description: str
+):
+    await create_test_order(client, seed_data)
+    await create_test_order(client, seed_data)
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=None,
+        amount=70000,
+        reference=f"TX_WILD_{len(description)}",
+        description=description,
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "UNMATCHED"
+
+
+# 13. Legacy order without numeric code gets a persisted one
+async def test_legacy_order_numeric_code_is_persisted(
+    client: AsyncClient, seed_data: dict, db_session: AsyncSession
+):
+    order_data = await create_test_order(client, seed_data)
+    headers = {"Authorization": f"Bearer {seed_data['token']}"}
+    order = (
+        await db_session.execute(select(Order).where(Order.id == order_data["id"]))
+    ).scalar_one()
+    order.numeric_order_code = None
+    await db_session.commit()
+
+    r = await client.post(
+        f"/api/v1/orders/{order_data['id']}/payments", headers=headers
+    )
+    assert r.status_code == 201
+
+    await db_session.refresh(order)
+    assert order.numeric_order_code is not None
+
+    payload = FakePayOSProvider().create_signed_webhook_payload(
+        order_code=order.numeric_order_code,
+        amount=order.amount_vnd,
+        reference="TX_LEGACY_001",
+    )
+    wh = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert wh.json()["status"] == "PROCESSED"
+
+
+# 14. Operators can complete a PENDING order directly
+async def test_operator_can_complete_pending_order(
+    client: AsyncClient, seed_data: dict
+):
+    order_data = await create_test_order(client, seed_data)
+    headers = {"Authorization": f"Bearer {seed_data['token']}"}
+    r = await client.patch(
+        f"/api/v1/orders/{order_data['id']}",
+        json={"status": "COMPLETED"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "COMPLETED"
+
+
+# 15. Malformed amounts are rejected with 400
+@pytest.mark.parametrize("bad_amount", ["12.5", None, "abc", -5, True, 12.5])
+async def test_bad_amount_rejected(client: AsyncClient, seed_data: dict, bad_amount):
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    payload = provider.create_signed_webhook_payload(
+        order_code=order_data["numeric_order_code"],
+        amount=bad_amount,
+        reference="TX_BADAMT",
+    )
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 400
+
+
+async def test_missing_amount_rejected(client: AsyncClient, seed_data: dict):
+    order_data = await create_test_order(client, seed_data)
+    provider = FakePayOSProvider()
+    data = {
+        "orderCode": order_data["numeric_order_code"],
+        "reference": "TX_NOAMT",
+        "code": "00",
+    }
+    payload = provider.create_signed_webhook_payload(data=data)
+    resp = await client.post("/api/v1/webhooks/fake", json=payload)
+    assert resp.status_code == 400
+
+
+# 16. Status filter must not treat % and _ as wildcards
+async def test_status_filter_wildcards_not_expanded(
+    client: AsyncClient, seed_data: dict
+):
+    await create_test_order(client, seed_data)
+    headers = {"Authorization": f"Bearer {seed_data['token']}"}
+    r = await client.get("/api/v1/orders", params={"status": "%"}, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["total"] == 0
+    r = await client.get(
+        "/api/v1/orders", params={"status": "pending"}, headers=headers
+    )
+    assert r.status_code == 200

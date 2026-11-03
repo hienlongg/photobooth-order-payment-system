@@ -5,13 +5,15 @@ from app.core.security import get_password_hash
 from app.db.base import Base
 from app.db.session import AsyncSessionLocal, engine
 from app.models.machine import Machine
+from app.models.order import Order  # noqa: F401
 from app.models.package import Package
+from app.models.payment import Payment, PaymentEvent  # noqa: F401
 from app.models.tenant import Tenant
 from app.models.user import User
 
 
 async def seed():
-    # 1. Ensure fresh tables
+    # 1. Ensure fresh tables with complete schema
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
@@ -109,11 +111,11 @@ async def seed():
 
         await db.commit()
         print("Database successfully seeded!")
-        print(f"Tenant ID:       {tenant.id}")
+        print(f"Tenant ID:             {tenant.id}")
         print(f"Machine 1 (online) ID: {m1.id}")
         print(f"Machine 3 (maint) ID:  {m_offline.id}")
-        print(f"Package 1 ID:    {p1.id} (Price: {p1.price_vnd} VND)")
-        print(f"Package 2 ID:    {p2.id} (Price: {p2.price_vnd} VND)")
+        print(f"Package 1 ID:          {p1.id} (Price: {p1.price_vnd} VND)")
+        print(f"Package 2 ID:          {p2.id} (Price: {p2.price_vnd} VND)")
         print("Users created: 'admin_user', 'operator_user', 'customer_user'")
 
 

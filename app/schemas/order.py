@@ -31,15 +31,16 @@ class OrderStatusUpdate(BaseModel):
     status: str = Field(
         ...,
         description="Target order status: 'completed' or 'cancelled'",
-        examples=["completed"],
+        examples=["COMPLETED"],
     )
 
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
-        if v not in ("completed", "cancelled"):
-            raise ValueError("status must be either 'completed' or 'cancelled'")
-        return v
+        normalized = v.strip().upper()
+        if normalized not in ("COMPLETED", "CANCELLED"):
+            raise ValueError("status must be either 'COMPLETED' or 'CANCELLED'")
+        return normalized
 
 
 class OrderResponse(BaseModel):
@@ -50,9 +51,12 @@ class OrderResponse(BaseModel):
     machine_id: UUID
     package_id: UUID
     order_code: str
+    numeric_order_code: int | None = None
     amount_vnd: int
     status: str
     payment_method: str
+    expires_at: datetime.datetime | None = None
+    paid_at: datetime.datetime | None = None
     created_at: datetime.datetime
 
 

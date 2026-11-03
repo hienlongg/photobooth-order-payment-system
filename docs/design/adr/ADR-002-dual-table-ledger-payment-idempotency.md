@@ -27,9 +27,9 @@ We implement a **Dual-Table Ledger Architecture** with **Database-Level Pessimis
    - A composite unique constraint is enforced on `payment_events(provider, reference)`.
    - When concurrent duplicate webhooks arrive, PostgreSQL's WAL engine guarantees that exactly one transaction succeeds; the duplicate transaction triggers an `IntegrityError` (PostgreSQL error code `23505`) and is rolled back safely.
 3. **Pessimistic Order Locking:**
-   - The webhook transaction executes `SELECT * FROM orders WHERE order_code = :code FOR UPDATE` to serialize status transitions on the target order record.
+   - The webhook transaction executes `SELECT * FROM orders WHERE id = :id FOR UPDATE` (with SQLAlchemy `populate_existing`) to serialize status transitions on the target order record. `populate_existing` is mandatory: without it the session's identity map returns the previously loaded, stale `status` after the lock wait, letting two different-reference webhooks both pay the same order.
 4. **Deterministic Finite State Machine:**
-   - Order transitions are guarded by `OrderStateMachine` (`PENDING -> PAID -> COMPLETED`). Attempts to re-transition a `PAID` order are treated as idempotent no-ops and safely acknowledged with HTTP 200 OK.
+   - Order transitions are guarded by `OrderStateMachine` (`PENDING -> PAID -> COMPLETED`). A different-reference payment arriving for an order that already holds money (`PAID`, `COMPLETED`, `LATE_PAYMENT`, `FLAGGED_FOR_REVIEW`) is recorded as a `DUPLICATE_PAYMENT` event with no transition, and any payment whose required transition is forbidden (e.g. `CANCELLED` order) is recorded as `REJECTED`. Provider-reported failures (`code != "00"`) are recorded as `FAILED`. All of these are acknowledged with HTTP 200 OK so the money trail is preserved and the gateway does not retry.
 
 ## Alternatives Considered
 1. **Single-Table Mutation (Updating `orders.status` directly):**
