@@ -559,8 +559,10 @@ To capture architecturally significant choices made during the engineering lifec
 The Domain Model presents the conceptual business entities, their semantic relationships, and structural cardinalities within the SnapSync multi-tenant photobooth ecosystem. In accordance with conceptual modeling standards, methods and implementation attributes are omitted.
 
 ```mermaid
+---
+title: SnapSync Domain Model (Conceptual Class Diagram)
+---
 classDiagram
-    title SnapSync Domain Model (Conceptual Class Diagram)
 
     class Tenant {
         +UUID id
@@ -692,8 +694,10 @@ classDiagram
 The Design-Level Class Diagram depicts software classes within the backend container, detailing attribute types, visibility scopes (`+` public, `-` private, `#` protected), operations with parameter and return types, and class relationships (generalization, composition, dependency).
 
 ```mermaid
+---
+title: SnapSync Design-Level Class Diagram
+---
 classDiagram
-    title SnapSync Design-Level Class Diagram
 
     class Base {
         <<Abstract>>
@@ -1220,7 +1224,7 @@ sequenceDiagram
             WebhookRouter-->>Gateway: HTTP 200 OK { status: "FAILED" } (order unchanged)
         end
         WebhookRouter->>DB: execute(SELECT * FROM orders WHERE id = :id FOR UPDATE, populate_existing)
-        Note over DB: Acquires Pessimistic Row Lock; populate_existing refreshes cached status
+        Note over DB: Acquires Pessimistic Row Lock, populate_existing refreshes cached status
         DB-->>WebhookRouter: order (fresh status, e.g. 'PENDING')
 
         alt Webhook A reaches DB Insert First
@@ -1241,7 +1245,7 @@ sequenceDiagram
         end
 
         alt Webhook C arrives with a DIFFERENT reference 'TXN-002' after the order is PAID
-            Note over WebhookRouter: Lock wait ends; populate_existing shows status 'PAID'
+            Note over WebhookRouter: Lock wait ends, populate_existing shows status 'PAID'
             WebhookRouter->>DB: INSERT INTO payment_events (reference='TXN-002', status='DUPLICATE_PAYMENT')
             WebhookRouter->>DB: COMMIT (order unchanged)
             WebhookRouter-->>Gateway: HTTP 200 OK { status: "DUPLICATE_PAYMENT" }
